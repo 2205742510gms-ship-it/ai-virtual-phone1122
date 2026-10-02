@@ -4364,28 +4364,92 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             setOfflineStreamPreview(null);
         }
     };
+const handleRetry = async (msgId: string) => {
+    const msgIndex = messages.findIndex(m => m.id === msgId);
+    if (msgIndex === -1 || messages[msgIndex].role !== "assistant") return;
 
-    const handleRetry = async (msgId: string) => {
-        const msgIndex = messages.findIndex(m => m.id === msgId);
-        if (msgIndex === -1 || messages[msgIndex].role !== "assistant") return;
+    const targetMsg = messages[msgIndex];
+    const contextMessages = messages.slice(0, msgIndex);
+    
+    // 【新增】：在删除前，把当前这版回复悄悄保存到本地历史候选箱
+    try {
+      const prevUserMsg = [...contextMessages].reverse().find(m => m.role === "user");
+      const turnKey = `chat_swipes_${session.id}_${prevUserMsg ? prevUserMsg.id : msgIndex}`;
+      const savedVersions: string[] = JSON.parse(localStorage.getItem(turnKey) || "[]");
+      const currentText = targetMsg.rawResponseText || targetMsg.editableResponseText || targetMsg.content || "";
+      if (currentText.trim() && !savedVersions.includes(currentText.trim())) {
+        savedVersions.push(currentText.trim());
+        localStorage.setItem(turnKey, JSON.stringify(savedVersions));
+      }
+    } catch (e) {
+      console.error("保存重试历史失败", e);
+    }
 
-        const contextMessages = messages.slice(0, msgIndex);
+    // Delete this message and everything after it
+    deleteChatMessagesFrom(msgId);
+    setMessages(prev => prev.slice(0, msgIndex));
+    setActiveMessageId(null);
 
-        // Delete this message and everything after it
-        deleteChatMessagesFrom(msgId);
-        setMessages(prev => prev.slice(0, msgIndex));
+    // Cancel any pending follow-up for this session
+    cancelFollowUp(session.id);
+
+    await runManagedGeneration({
+      history: contextMessages,
+      errorPrefix: "重试失败",
+      onDecline: triggerReply,
+    });
+  };
+// 【新增】：一键轮流切换已保存的历史版本（Swipes 候选切换）
+  const handleSwitchVersion = (targetMsgId: string) => {
+    const msgIndex = messages.findIndex(m => m.id === targetMsgId);
+    if (msgIndex === -1) return;
+
+    const targetMsg = messages[msgIndex];
+    const contextMessages = messages.slice(0, msgIndex);
+    const prevUserMsg = [...contextMessages].reverse().find(m => m.role === "user");
+    const turnKey = `chat_swipes_${session.id}_${prevUserMsg ? prevUserMsg.id : msgIndex}`;
+
+    try {
+      let savedVersions: string[] = JSON.parse(localStorage.getItem(turnKey) || "[]");
+      const currentText = (targetMsg.rawResponseText || targetMsg.editableResponseText || targetMsg.content || "").trim();
+
+      // 把当前这一版也装入候选箱（防止切走后回不来）
+      if (currentText && !savedVersions.includes(currentText)) {
+        savedVersions.push(currentText);
+        localStorage.setItem(turnKey, JSON.stringify(savedVersions));
+      }
+
+      if (savedVersions.length <= 1) {
+        showChatToast("当前消息暂无其他历史版本（点重试后会自动保存）");
         setActiveMessageId(null);
+        return;
+      }
 
-        // Cancel any pending follow-up for this session
-        cancelFollowUp(session.id);
+      // 找到当前版本，轮转切换到下一个版本
+      let currIdx = savedVersions.indexOf(currentText);
+      if (currIdx === -1) currIdx = savedVersions.length - 1;
+      const nextIdx = (currIdx + 1) % savedVersions.length;
+      const nextText = savedVersions[nextIdx];
 
-        await runManagedGeneration({
-            history: contextMessages,
-            errorPrefix: "重试失败",
-            onDecline: triggerReply,
-        });
-    };
+      // 更新屏幕上的气泡内容
+      setMessages(prev => prev.map(m => {
+        if (m.id === targetMsgId) {
+          return {
+            ...m,
+            content: nextText,
+            rawResponseText: nextText,
+            editableResponseText: nextText,
+          };
+        }
+        return m;
+      }));
 
+      setActiveMessageId(null);
+      showChatToast(`已切换至版本 (${nextIdx + 1}/${savedVersions.length})`);
+    } catch (e) {
+      console.error("切换历史版本失败", e);
+    }
+  };
     const handleRetractMessage = (msgId: string) => {
         retractChatMessage(msgId);
         setMessages(prev => prev.map(m => m.id === msgId ? { ...m, isRetracted: true } : m));
@@ -4915,8 +4979,11 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         <button onClick={() => handleRetractMessage(storedMessageId)} className="ctx-menu-btn">撤回消息</button>
                     )}
                     {m.role === "assistant" && (
-                        <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
-                    )}
+  <>
+    <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
+    <button onClick={() => handleSwitchVersion(storedMessageId)} className="ctx-menu-btn">📜 切换版本</button>
+  </>
+)}
                 </div>
                 <div className="flex">
                     <button onClick={() => { setQuotingMessage(m); setActiveMessageId(null); }} className="ctx-menu-btn">引用</button>
